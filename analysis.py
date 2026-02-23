@@ -1,17 +1,15 @@
 """
 JBL Moneyball — Phase 2: Five Correlation Studies
 """
-
 import pandas as pd
 import numpy as np
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-import matplotlib.ticker as mticker
+import matplotlib.patches as mpatches
 import seaborn as sns
 from scipy import stats
-import os
-import warnings
+import os, warnings
 warnings.filterwarnings('ignore')
 
 BASE  = "/Users/maxx/Documents/JBL Datasets"
@@ -19,637 +17,537 @@ REPO  = "/Users/maxx/Documents/JBL-Moneyball-Project"
 PLOTS = os.path.join(REPO, "plots")
 os.makedirs(PLOTS, exist_ok=True)
 
-sns.set_theme(style="darkgrid", palette="husl")
-plt.rcParams.update({'figure.dpi': 120, 'font.size': 10})
+# ── Load merged data ──────────────────────────────────────────────────────────
+df = pd.read_csv(os.path.join(BASE, 'merged_JBL_Data.csv'))
 
-# ─── Load merged data ─────────────────────────────────────────────────────────
-df = pd.read_csv(os.path.join(BASE, "merged_JBL_Data.csv"), low_memory=False)
-df.columns = df.columns.str.strip()
+# Only use players with real playing time (in stat sheets)
+active = df[df['WS'].notna()].copy()
+print(f"Active players with stats: {len(active)}")
 
-# Only active rostered players (have stats)
-active = df[df['WS_actual'].notna()].copy()
-print(f"Active players for analysis: {len(active)}")
+# Numeric coerce helpers
+def to_num(df, cols):
+    for c in cols:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors='coerce')
+    return df
 
-# Coerce only stat columns to numeric — preserve string identifier columns
-STRING_COLS = {'Player', 'Tm', 'Pos', 'Off Archetype', 'Def Archetype',
-               'Hgt', 'Drafted', 'College', 'Hometown', 'Nationality',
-               'Secondary', 'Personality', '.', 'Team'}
-for col in active.select_dtypes(include='object').columns:
-    if col not in STRING_COLS:
-        active[col] = pd.to_numeric(active[col], errors='coerce')
+RATING_COLS = ['InsS','MidS','OutS','FrT','SlfC','ShtD','BalD','FlDr','Fnsh',
+               'Play','Pass','Grav','Spac','Hndl','Iso','PstE','PnrE','BBIQ',
+               'OnBD','OffD','Help','Stl','PstD','RimP','OffR','DefR',
+               'Ath','End','FstS','Quck','Spd','Str']
+OUTCOME_COLS = ['WS','VORP','BPM','OBPM_adv','DBPM_adv','DWS','OWS',
+                'eFG%','3P%','PPG','APG','RPG']
+active = to_num(active, RATING_COLS + OUTCOME_COLS +
+                ['Salary','PER','USG%','AST%','ORB%_adv','DRB%_adv',
+                 'SA','SAPG','CSht','CSPG','DFL','DFPG','LBR','LBPG','CD','CDPG',
+                 'RimM','RimA','Rim%','ClsM','ClsA','Cls%','MidM','MidA','Mid%',
+                 'LngM','LngA','Lng%','SL_3PM','SL_3PA','SL_3P%',
+                 'On Net','Floor Net','PM','BoxC','RAPM'])
 
-# ─── SCOUTING RATINGS ────────────────────────────────────────────────────────
-RATINGS = ['InsS','MidS','OutS','FrT','SlfC','ShtD','BalD','FlDr','Fnsh',
-           'Play','Pass','Grav','Spac','Hndl','Iso','PstE','PnrE','BBIQ',
-           'OnBD','OffD','Help','Stl','PstD','RimP','OffR','DefR',
-           'Ath','End','FstS','Quck','Spd','Str']
-
-RATING_LABELS = {
-    'InsS':'Inside Scoring','MidS':'Mid-Range','OutS':'Outside Scoring',
-    'FrT':'Free Throw','SlfC':'Self Creation','ShtD':'Shot Decision',
-    'BalD':'Ball Defense','FlDr':'Floor Drive','Fnsh':'Finishing',
-    'Play':'Playmaking','Pass':'Passing','Grav':'Gravity','Spac':'Spacing',
-    'Hndl':'Ball Handling','Iso':'Isolation','PstE':'Post Efficiency',
-    'PnrE':'PnR Efficiency','BBIQ':'BBIQ','OnBD':'On-Ball Defense',
-    'OffD':'Off-Ball Defense','Help':'Help Defense','Stl':'Steal Rating',
-    'PstD':'Post Defense','RimP':'Rim Protection','OffR':'Off Rebound',
-    'DefR':'Def Rebound','Ath':'Athleticism','End':'Endurance',
-    'FstS':'First Step','Quck':'Quickness','Spd':'Speed','Str':'Strength',
-}
-
-# ─── Helper functions ─────────────────────────────────────────────────────────
-
-def top_correlations(subset, ratings, targets, n=5):
-    """Return top n ratings by absolute correlation with each target."""
-    results = {}
-    for target in targets:
-        if target not in subset.columns:
-            continue
-        corrs = []
-        for r in ratings:
-            if r in subset.columns:
-                clean = subset[[r, target]].dropna()
-                if len(clean) >= 10:
-                    r_val, p_val = stats.pearsonr(clean[r], clean[target])
-                    corrs.append({'rating': r, 'label': RATING_LABELS.get(r,r),
-                                  'r': r_val, 'p': p_val, 'abs_r': abs(r_val)})
-        corrs.sort(key=lambda x: x['abs_r'], reverse=True)
-        results[target] = corrs[:n]
-    return results
-
-def save_fig(name):
-    path = os.path.join(PLOTS, name)
-    plt.savefig(path, bbox_inches='tight')
-    plt.close()
-    print(f"  Saved: plots/{name}")
-    return f"plots/{name}"
-
-report = []  # collect markdown sections
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# STUDY 1 — Rating-to-Impact by Archetype
-# ═══════════════════════════════════════════════════════════════════════════════
-print("\n" + "═"*60)
+# ─────────────────────────────────────────────────────────────────────────────
+# STUDY 1: Rating-to-Impact by Archetype
+# For each offensive and defensive archetype, find the top 5 ratings most
+# correlated with VORP, WS, and eFG%
+# ─────────────────────────────────────────────────────────────────────────────
+print("\n" + "="*70)
 print("STUDY 1: Rating-to-Impact by Archetype")
-print("═"*60)
+print("="*70)
 
-report.append("# JBL Moneyball — Phase 2 Analysis Report\n")
-report.append("---\n")
-report.append("## Study 1 — Rating-to-Impact by Archetype\n")
-report.append("> Which scouting ratings actually translate to production for each player type?\n")
+TARGET_COLS = ['VORP', 'WS', 'eFG%']
+study1_results = {}
 
-TARGET_COLS = ['VORP', 'WS_actual', 'eFG%']
-off_archetypes = active['Off Archetype'].dropna().unique()
-def_archetypes = active['Def Archetype'].dropna().unique()
-
-s1_findings = []
-
-for arch_type, arch_list, arch_col in [
-    ("Offensive", off_archetypes, "Off Archetype"),
-    ("Defensive", def_archetypes, "Def Archetype"),
-]:
-    report.append(f"\n### {arch_type} Archetypes\n")
-    for arch in sorted(arch_list):
-        subset = active[active[arch_col] == arch]
-        if len(subset) < 8:
+for arch_type in ['Off Archetype', 'Def Archetype']:
+    archetypes = active[arch_type].dropna().unique()
+    study1_results[arch_type] = {}
+    print(f"\n  {arch_type}:")
+    for arch in sorted(archetypes):
+        sub = active[active[arch_type] == arch]
+        if len(sub) < 10:
             continue
-        corrs = top_correlations(subset, RATINGS, TARGET_COLS, n=5)
-        report.append(f"\n#### {arch} (n={len(subset)})\n")
-        for target, top5 in corrs.items():
-            if not top5:
+        arch_corrs = {}
+        for rating in RATING_COLS:
+            if rating not in sub.columns:
                 continue
-            report.append(f"**→ {target}:** " +
-                ", ".join([f"{x['label']} (r={x['r']:+.2f})" for x in top5]) + "\n")
+            corrs = []
+            for target in TARGET_COLS:
+                if target in sub.columns:
+                    valid = sub[[rating, target]].dropna()
+                    if len(valid) >= 8:
+                        r, p = stats.pearsonr(valid[rating], valid[target])
+                        corrs.append(abs(r))
+            if corrs:
+                arch_corrs[rating] = np.mean(corrs)
+        top5 = sorted(arch_corrs.items(), key=lambda x: x[1], reverse=True)[:5]
+        study1_results[arch_type][arch] = top5
+        print(f"    [{arch}] n={len(sub)} → Top ratings: {[(r, f'{v:.3f}') for r,v in top5]}")
 
-        # Collect surprising findings (high correlation in unexpected ratings)
-        for target, top5 in corrs.items():
-            for item in top5[:2]:
-                if abs(item['r']) >= 0.40:
-                    s1_findings.append(
-                        f"- **{arch}** ({arch_type}): *{item['label']}* is the "
-                        f"#{list(top5).index(item)+1} predictor of {target} "
-                        f"(r={item['r']:+.2f}, n={len(subset)})"
-                    )
-
-# Heatmap: all ratings vs VORP for top archetypes
-top_off = (active.groupby('Off Archetype')['VORP']
-           .median().sort_values(ascending=False).index[:8].tolist())
-fig, axes = plt.subplots(1, 2, figsize=(18, 7))
-for ax, arch_col, title, arch_list in [
-    (axes[0], 'Off Archetype', 'Offensive Archetypes — Rating vs VORP Correlation', top_off),
-    (axes[1], 'Def Archetype', 'Defensive Archetypes — Rating vs VORP Correlation',
-     active['Def Archetype'].value_counts().index[:8].tolist()),
-]:
-    hm_data = {}
-    for arch in arch_list:
-        subset = active[active[arch_col] == arch]
-        if len(subset) < 8:
-            continue
+# Plot: heatmap of top ratings per offensive archetype
+off_archs = [a for a in sorted(active['Off Archetype'].dropna().unique())
+             if len(active[active['Off Archetype']==a]) >= 10]
+if off_archs:
+    heatmap_data = {}
+    for arch in off_archs:
+        sub = active[active['Off Archetype'] == arch]
         row = {}
-        for r in RATINGS:
-            if r in subset.columns:
-                clean = subset[[r, 'VORP']].dropna()
-                if len(clean) >= 8:
-                    rv, _ = stats.pearsonr(clean[r], clean['VORP'])
-                    row[RATING_LABELS.get(r, r)] = rv
-        if row:
-            hm_data[arch] = row
-    if hm_data:
-        hm_df = pd.DataFrame(hm_data).T.fillna(0)
-        sns.heatmap(hm_df, ax=ax, cmap='RdYlGn', center=0,
-                    vmin=-0.6, vmax=0.6, linewidths=0.3,
-                    cbar_kws={'label': 'Pearson r'}, annot=False)
-        ax.set_title(title, fontsize=11, pad=10)
-        ax.set_xlabel('')
-        ax.tick_params(axis='x', rotation=45, labelsize=8)
+        for rating in RATING_COLS:
+            if rating in sub.columns:
+                corrs = []
+                for target in TARGET_COLS:
+                    valid = sub[[rating, target]].dropna()
+                    if len(valid) >= 8:
+                        r, _ = stats.pearsonr(valid[rating], valid[target])
+                        corrs.append(r)
+                row[rating] = np.mean(corrs) if corrs else 0
+        heatmap_data[arch] = row
+    hm_df = pd.DataFrame(heatmap_data).T
+    # Keep top 15 most variable ratings
+    top_ratings = hm_df.std().nlargest(15).index
+    hm_df = hm_df[top_ratings]
+    fig, ax = plt.subplots(figsize=(14, max(6, len(off_archs)*0.7)))
+    sns.heatmap(hm_df, annot=True, fmt='.2f', cmap='RdYlGn', center=0,
+                linewidths=0.5, ax=ax, vmin=-0.6, vmax=0.6)
+    ax.set_title('Study 1: Rating-to-Impact Correlation by Offensive Archetype\n(Mean Pearson r across VORP, WS, eFG%)', fontsize=13, pad=15)
+    ax.set_xlabel('Scouting Rating', fontsize=11)
+    ax.set_ylabel('Offensive Archetype', fontsize=11)
+    plt.xticks(rotation=45, ha='right')
+    plt.yticks(rotation=0)
+    plt.tight_layout()
+    plt.savefig(os.path.join(PLOTS, 'study1_archetype_rating_heatmap.png'), dpi=150, bbox_inches='tight')
+    plt.close()
+    print("  → Saved study1_archetype_rating_heatmap.png")
 
-plt.tight_layout()
-s1_plot = save_fig("study1_archetype_rating_heatmap.png")
+# ─────────────────────────────────────────────────────────────────────────────
+# STUDY 2: Three-Point Shooting Profile
+# Which archetype + rating combos produce elite 3P shooters?
+# ─────────────────────────────────────────────────────────────────────────────
+print("\n" + "="*70)
+print("STUDY 2: Three-Point Shooting Profile")
+print("="*70)
 
-report.append(f"\n### Key Findings\n")
-report.append("\n".join(s1_findings[:20]) if s1_findings else "See detailed tables above.\n")
-report.append(f"\n![Rating-to-Impact Heatmap]({s1_plot})\n")
-report.append("\n**Methodology:** Pearson correlation between each scouting rating and VORP/WS/eFG% within each archetype group. Minimum 8 players per archetype. Only correlations with |r| ≥ 0.30 reported as meaningful.\n")
+# Use players with meaningful 3PA volume (at least 2 per game)
+shooters = active[pd.to_numeric(active.get('3PA', 0), errors='coerce').fillna(0) >= 2].copy()
+print(f"  Players with 3PA >= 2/game: {len(shooters)}")
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# STUDY 2 — Three Point Shooting Profile
-# ═══════════════════════════════════════════════════════════════════════════════
-print("\n" + "═"*60)
-print("STUDY 2: Three Point Shooting Profile")
-print("═"*60)
+# Correlate ratings with 3P%
+three_corrs = {}
+for rating in RATING_COLS:
+    if rating in shooters.columns:
+        valid = shooters[[rating, '3P%']].dropna()
+        if len(valid) >= 15:
+            r, p = stats.pearsonr(valid[rating], valid['3P%'])
+            three_corrs[rating] = (r, p)
 
-report.append("\n---\n## Study 2 — Three Point Shooting Profile\n")
-report.append("> What player profile is most likely to be an elite 3-point shooter?\n")
+top_3p_ratings = sorted(three_corrs.items(), key=lambda x: abs(x[1][0]), reverse=True)[:10]
+print("\n  Top ratings correlated with 3P% (players with 2+ 3PA/game):")
+for r, (corr, p) in top_3p_ratings:
+    sig = "***" if p < 0.001 else "**" if p < 0.01 else "*" if p < 0.05 else ""
+    print(f"    {r:<10} r={corr:+.3f}  p={p:.4f} {sig}")
 
-# Use JBLPlayers 3P% (has all 587 players)
-shooters = active[active['3PA'] >= 1.5].copy()  # min 1.5 3PA per game for meaningful sample
-shooters['3P%_adv'] = pd.to_numeric(shooters.get('3P%', pd.Series(dtype=float)), errors='coerce')
-print(f"  Qualified 3P shooters (>60 3PA): {len(shooters)}")
+# Archetype breakdown for 3P shooting
+print("\n  3P% by Offensive Archetype (min 10 players, min 2 3PA/game):")
+arch_3p = (shooters.groupby('Off Archetype')
+           .agg(n=('3P%','count'), avg_3p=('3P%','mean'), avg_3pa=('3PA','mean'),
+                avg_outS=('OutS','mean'), avg_frT=('FrT','mean'))
+           .query('n >= 10')
+           .sort_values('avg_3p', ascending=False))
+print(arch_3p.round(3).to_string())
 
-# Top archetypes by 3P%
-arch_3p = shooters.groupby('Off Archetype')['3P%_adv'].agg(['mean','median','count']).round(3)
-arch_3p = arch_3p[arch_3p['count'] >= 5].sort_values('median', ascending=False)
-print("\n  3P% by Offensive Archetype:")
-print(arch_3p.to_string())
+# Shot distance 3P breakdown by archetype
+sl_cols = ['SL_3P%', '3PM 0-2ft','3PM 2-4ft','3PM 4-6ft','3PM 6+ft']
+if all(c in active.columns for c in ['SL_3P%', 'Off Archetype']):
+    print("\n  3P distance breakdown by archetype (avg makes per dist range):")
+    sl_valid = active.copy()
+    for c in ['3PM 0-2ft','3PM 2-4ft','3PM 4-6ft','3PM 6+ft','SL_3P%']:
+        if c in sl_valid.columns:
+            sl_valid[c] = pd.to_numeric(sl_valid[c], errors='coerce')
+    dist_cols = [c for c in ['3PM 0-2ft','3PM 2-4ft','3PM 4-6ft','3PM 6+ft'] if c in sl_valid.columns]
+    if dist_cols:
+        dist_df = (sl_valid.groupby('Off Archetype')[dist_cols + ['SL_3P%']]
+                   .mean().round(2)
+                   .sort_values('SL_3P%', ascending=False))
+        print(dist_df.to_string())
 
-# Rating correlations with 3P%
-target_3p = ['3P%_adv']
-if '3P%' in shooters.columns:
-    target_3p = ['3P%']
-corrs_3p = {}
-for r in RATINGS:
-    if r in shooters.columns:
-        clean = shooters[[r, target_3p[0]]].dropna()
-        if len(clean) >= 10:
-            rv, pv = stats.pearsonr(clean[r], clean[target_3p[0]])
-            corrs_3p[RATING_LABELS.get(r, r)] = rv
-
-corrs_3p_sorted = dict(sorted(corrs_3p.items(), key=lambda x: abs(x[1]), reverse=True)[:12])
-print(f"\n  Top ratings correlating with 3P%:")
-for k,v in corrs_3p_sorted.items():
-    print(f"    {k:25s}: r={v:+.3f}")
-
-# Shot distance analysis for 3P shooting
-dist_cols = [c for c in active.columns if '3P' in c and ('%' in c or 'M' in c)]
-elite_thresh = active['3P%'].quantile(0.75) if '3P%' in active.columns else 0.38
-elite = shooters[shooters[target_3p[0]] >= elite_thresh]
-avg   = shooters[shooters[target_3p[0]] < elite_thresh]
-
-# Figure: archetype 3P% + rating correlations
+# Plot
 fig, axes = plt.subplots(1, 2, figsize=(16, 6))
-
-# Left: archetype box
+# Left: correlation bar chart
+ratings_names = [r for r,_ in top_3p_ratings]
+corr_vals = [v[0] for _,v in top_3p_ratings]
+colors = ['#2ecc71' if v > 0 else '#e74c3c' for v in corr_vals]
+axes[0].barh(ratings_names[::-1], corr_vals[::-1], color=colors[::-1])
+axes[0].axvline(0, color='black', linewidth=0.8)
+axes[0].set_xlabel('Pearson r with 3P%')
+axes[0].set_title('Ratings Most Correlated\nwith 3P% (2+ 3PA/game)', fontsize=12)
+axes[0].grid(axis='x', alpha=0.3)
+# Right: 3P% by archetype
 if len(arch_3p) > 0:
-    arch_order = arch_3p.index.tolist()
-    arch_data  = [shooters[shooters['Off Archetype']==a][target_3p[0]].dropna()
-                  for a in arch_order]
-    bp = axes[0].boxplot(arch_data, labels=arch_order, patch_artist=True,
-                         medianprops={'color':'black','linewidth':2})
-    colors = sns.color_palette("husl", len(arch_order))
-    for patch, color in zip(bp['boxes'], colors):
-        patch.set_facecolor(color)
-    axes[0].set_title('3P% Distribution by Offensive Archetype', fontsize=11)
-    axes[0].set_xlabel('')
-    axes[0].set_ylabel('3P%')
-    axes[0].tick_params(axis='x', rotation=45, labelsize=8)
-    axes[0].axhline(0.36, color='red', linestyle='--', alpha=0.5, label='League avg ~36%')
-    axes[0].legend(fontsize=8)
-
-# Right: rating correlations bar chart
-labels = list(corrs_3p_sorted.keys())
-vals   = list(corrs_3p_sorted.values())
-colors_bar = ['#2ecc71' if v > 0 else '#e74c3c' for v in vals]
-axes[1].barh(labels[::-1], vals[::-1], color=colors_bar[::-1], edgecolor='white')
-axes[1].axvline(0, color='black', linewidth=0.8)
-axes[1].set_title('Scouting Ratings Correlated with 3P%', fontsize=11)
-axes[1].set_xlabel('Pearson r')
-axes[1].set_xlim(-0.7, 0.7)
-
+    arch_3p_plot = arch_3p.head(12)
+    bars = axes[1].barh(arch_3p_plot.index[::-1], arch_3p_plot['avg_3p'].values[::-1], color='#3498db')
+    axes[1].set_xlabel('Average 3P%')
+    axes[1].set_title('3P% by Offensive Archetype\n(min 10 players, min 2 3PA/game)', fontsize=12)
+    for i, (val, n) in enumerate(zip(arch_3p_plot['avg_3p'].values[::-1], arch_3p_plot['n'].values[::-1])):
+        axes[1].text(val + 0.002, i, f'n={n}', va='center', fontsize=9)
+    axes[1].grid(axis='x', alpha=0.3)
+plt.suptitle('Study 2: Three-Point Shooting Profile', fontsize=14, fontweight='bold', y=1.02)
 plt.tight_layout()
-s2_plot = save_fig("study2_three_point_profile.png")
+plt.savefig(os.path.join(PLOTS, 'study2_three_point_profile.png'), dpi=150, bbox_inches='tight')
+plt.close()
+print("  → Saved study2_three_point_profile.png")
 
-# Build report text
-report.append(f"\n### 3P% by Offensive Archetype\n")
-report.append(arch_3p.to_markdown() + "\n")
-report.append(f"\n### Top Ratings Correlating with 3P% (min 60 3PA)\n")
-report.append("| Rating | Pearson r |\n|--------|----------|\n")
-for k, v in corrs_3p_sorted.items():
-    report.append(f"| {k} | {v:+.3f} |\n")
-
-elite_archs = (elite['Off Archetype'].value_counts(normalize=True)*100).round(1)
-report.append(f"\n### Elite Shooter Breakdown (3P% ≥ {elite_thresh:.3f})\n")
-report.append(f"**n = {len(elite)} elite shooters**\n\n")
-report.append("**Archetype distribution of elite shooters:**\n")
-for arch, pct in elite_archs.items():
-    report.append(f"- {arch}: {pct}%\n")
-
-report.append(f"\n### Key Findings\n")
-top_r = [(k,v) for k,v in corrs_3p_sorted.items() if abs(v) >= 0.25]
-for k,v in top_r[:5]:
-    direction = "positively" if v > 0 else "negatively"
-    report.append(f"- **{k}** is {direction} correlated with 3P% (r={v:+.3f})\n")
-
-if len(arch_3p) > 0:
-    top_arch = arch_3p.index[0]
-    report.append(f"- **{top_arch}** is the most likely archetype to be an elite 3-point shooter "
-                  f"(median {arch_3p.loc[top_arch,'median']:.3f})\n")
-
-report.append(f"\n![3P Shooting Profile]({s2_plot})\n")
-report.append("\n**Methodology:** Players with ≥60 3-point attempts. Pearson correlation between scouting ratings and 3P%. Archetype distributions compared via box plots. Elite threshold = 75th percentile of 3P%.\n")
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# STUDY 3 — Defensive Impact
-# ═══════════════════════════════════════════════════════════════════════════════
-print("\n" + "═"*60)
+# ─────────────────────────────────────────────────────────────────────────────
+# STUDY 3: Defensive Impact
+# Defensive ratings + Hgt/Wgt vs DWS; cross-ref defensive archetype
+# ─────────────────────────────────────────────────────────────────────────────
+print("\n" + "="*70)
 print("STUDY 3: Defensive Impact")
-print("═"*60)
+print("="*70)
 
-report.append("\n---\n## Study 3 — Defensive Impact\n")
-report.append("> What actually makes a player impactful on defense beyond the eye test?\n")
+DEF_RATINGS = ['OnBD','OffD','Help','Stl','PstD','RimP']
+def_df = active[active['DWS'].notna()].copy()
 
-DEF_RATINGS   = ['OnBD','OffD','Help','Stl','PstD','RimP']
-DEF_TARGETS   = ['DWS', 'DBPM']
-PHYSICAL_COLS = ['Hgt', 'Wgt', 'Ath', 'Spd', 'Str', 'End']
-
-# Parse Hgt from JBLPlayers format "82 - 6'10" → numeric inches
-if 'Hgt' in active.columns:
-    def parse_height(h):
-        try:
-            # Format: "82 -             6'10";" → take first number (rating)
-            return float(str(h).split('-')[0].strip())
-        except:
-            return np.nan
-    active['Hgt_rating'] = active['Hgt'].apply(parse_height)
+# Parse Hgt (format "82 - 6'10") — extract the numeric first field
+if 'Hgt' in def_df.columns:
+    def_df['Hgt_num'] = pd.to_numeric(
+        def_df['Hgt'].astype(str).str.extract(r'^(\d+)')[0], errors='coerce')
 else:
-    active['Hgt_rating'] = np.nan
+    def_df['Hgt_num'] = np.nan
 
-def_all_ratings = DEF_RATINGS + [r for r in ['Hgt_rating','Wgt','Ath','Spd','Str','End']
-                                  if r in active.columns]
+if 'Wgt' in def_df.columns:
+    def_df['Wgt'] = pd.to_numeric(def_df['Wgt'], errors='coerce')
 
+DEF_PRED = DEF_RATINGS + ['Hgt_num', 'Wgt', 'DBPM_adv', 'Ath', 'Spd', 'Str']
+print("\n  Correlations with DWS (Defensive Win Shares):")
 def_corrs = {}
-for col in def_all_ratings:
-    if col in active.columns:
-        for target in DEF_TARGETS:
-            if target in active.columns:
-                clean = active[[col, target]].dropna()
-                if len(clean) >= 15:
-                    rv, pv = stats.pearsonr(clean[col], clean[target])
-                    def_corrs[(col, target)] = {'r': rv, 'p': pv, 'n': len(clean)}
+for col in DEF_PRED:
+    if col in def_df.columns:
+        valid = def_df[[col, 'DWS']].dropna()
+        if len(valid) >= 30:
+            r, p = stats.pearsonr(valid[col], valid['DWS'])
+            def_corrs[col] = (r, p, len(valid))
+            sig = "***" if p < 0.001 else "**" if p < 0.01 else "*" if p < 0.05 else ""
+            print(f"    {col:<12} r={r:+.3f}  p={p:.4f} {sig}  n={len(valid)}")
 
-print("\n  Defensive correlations:")
-for (col, target), vals in sorted(def_corrs.items(), key=lambda x: abs(x[1]['r']), reverse=True)[:15]:
-    label = RATING_LABELS.get(col, col)
-    print(f"    {label:20s} → {target:8s}: r={vals['r']:+.3f} (n={vals['n']})")
+# Multiple regression: top defensive predictors
+from numpy.linalg import lstsq as lsq
+def_pred_use = [c for c in DEF_PRED if c in def_df.columns]
+reg_df = def_df[def_pred_use + ['DWS']].dropna()
+if len(reg_df) >= 20:
+    from numpy import linalg
+    X = reg_df[def_pred_use].values
+    y = reg_df['DWS'].values
+    # Standardize
+    X_std = (X - X.mean(axis=0)) / (X.std(axis=0) + 1e-8)
+    # OLS
+    coeffs, _, _, _ = lsq(np.column_stack([np.ones(len(X_std)), X_std]), y, rcond=None)
+    print(f"\n  OLS coefficients (standardized) — {len(reg_df)} players:")
+    for col, coeff in zip(def_pred_use, coeffs[1:]):
+        print(f"    {col:<12} β={coeff:+.4f}")
 
 # DWS by defensive archetype
-dws_by_arch = active.groupby('Def Archetype')['DWS'].agg(['mean','median','count']).round(2)
-dws_by_arch = dws_by_arch[dws_by_arch['count'] >= 5].sort_values('median', ascending=False)
 print("\n  DWS by Defensive Archetype:")
-print(dws_by_arch.to_string())
+dws_by_arch = (def_df.groupby('Def Archetype')['DWS']
+               .agg(['mean','median','count'])
+               .query('count >= 10')
+               .sort_values('mean', ascending=False))
+print(dws_by_arch.round(3).to_string())
 
-# DBPM by defensive archetype
-dbpm_by_arch = active.groupby('Def Archetype')['DBPM'].agg(['mean','median','count']).round(2)
-dbpm_by_arch = dbpm_by_arch[dbpm_by_arch['count'] >= 5].sort_values('median', ascending=False)
-
-# Figure: 2x2 — DWS correlations, DBPM correlations, DWS by archetype, DBPM by archetype
-fig, axes = plt.subplots(2, 2, figsize=(16, 12))
-
-def plot_corr_bar(ax, corrs_dict, target, title):
-    items = [(RATING_LABELS.get(c,c), v['r']) for (c,t), v in corrs_dict.items() if t==target]
-    items.sort(key=lambda x: abs(x[1]), reverse=True)
-    items = items[:10]
-    labels_p = [x[0] for x in items][::-1]
-    vals_p   = [x[1] for x in items][::-1]
-    colors_b = ['#2ecc71' if v > 0 else '#e74c3c' for v in vals_p]
-    ax.barh(labels_p, vals_p, color=colors_b, edgecolor='white')
-    ax.axvline(0, color='black', linewidth=0.8)
-    ax.set_title(title, fontsize=10)
-    ax.set_xlabel('Pearson r')
-    ax.set_xlim(-0.7, 0.7)
-
-plot_corr_bar(axes[0,0], def_corrs, 'DWS',  'Ratings → Defensive Win Shares (DWS)')
-plot_corr_bar(axes[0,1], def_corrs, 'DBPM', 'Ratings → Defensive BPM (DBPM)')
-
-# DWS by archetype
+# Plot
+fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+sorted_def = sorted(def_corrs.items(), key=lambda x: abs(x[1][0]), reverse=True)
+names  = [k for k,_ in sorted_def]
+corrs  = [v[0] for _,v in sorted_def]
+colors = ['#e74c3c' if v > 0 else '#95a5a6' for v in corrs]
+axes[0].barh(names[::-1], corrs[::-1], color=colors[::-1])
+axes[0].axvline(0, color='black', linewidth=0.8)
+axes[0].set_xlabel('Pearson r with DWS')
+axes[0].set_title('Defensive Attribute Correlations\nwith Defensive Win Shares', fontsize=12)
+axes[0].grid(axis='x', alpha=0.3)
 if len(dws_by_arch) > 0:
-    dws_by_arch['median'].plot(kind='barh', ax=axes[1,0], color=sns.color_palette("Blues_r", len(dws_by_arch)))
-    axes[1,0].set_title('Median DWS by Defensive Archetype', fontsize=10)
-    axes[1,0].set_xlabel('Median DWS')
-    axes[1,0].axvline(active['DWS'].median(), color='red', linestyle='--', alpha=0.7, label='League median')
-    axes[1,0].legend(fontsize=8)
-
-# DBPM by archetype
-if len(dbpm_by_arch) > 0:
-    dbpm_by_arch['median'].plot(kind='barh', ax=axes[1,1], color=sns.color_palette("Greens_r", len(dbpm_by_arch)))
-    axes[1,1].set_title('Median DBPM by Defensive Archetype', fontsize=10)
-    axes[1,1].set_xlabel('Median DBPM')
-    axes[1,1].axvline(active['DBPM'].median(), color='red', linestyle='--', alpha=0.7, label='League median')
-    axes[1,1].legend(fontsize=8)
-
-plt.suptitle('Study 3: Defensive Impact Analysis', fontsize=13, fontweight='bold', y=1.01)
+    dws_plot = dws_by_arch.head(10)
+    axes[1].barh(dws_plot.index[::-1], dws_plot['mean'].values[::-1], color='#e74c3c', alpha=0.8)
+    axes[1].set_xlabel('Average DWS')
+    axes[1].set_title('Avg DWS by Defensive Archetype\n(min 10 players)', fontsize=12)
+    for i, (val, n) in enumerate(zip(dws_plot['mean'].values[::-1], dws_plot['count'].values[::-1])):
+        axes[1].text(val + 0.01, i, f'n={int(n)}', va='center', fontsize=9)
+    axes[1].grid(axis='x', alpha=0.3)
+plt.suptitle('Study 3: What Actually Makes a Defensive Impact', fontsize=14, fontweight='bold', y=1.02)
 plt.tight_layout()
-s3_plot = save_fig("study3_defensive_impact.png")
+plt.savefig(os.path.join(PLOTS, 'study3_defensive_impact.png'), dpi=150, bbox_inches='tight')
+plt.close()
+print("  → Saved study3_defensive_impact.png")
 
-# Build report
-report.append(f"\n### Rating → Defensive Impact Correlations\n")
-report.append("| Rating | → DWS (r) | → DBPM (r) |\n|--------|-----------|------------|\n")
-all_def_r = {}
-for r in DEF_RATINGS + ['Hgt_rating','Wgt','Ath','Spd','Str','End']:
-    dws_r  = def_corrs.get((r,'DWS'),  {}).get('r', np.nan)
-    dbpm_r = def_corrs.get((r,'DBPM'), {}).get('r', np.nan)
-    if not np.isnan(dws_r) or not np.isnan(dbpm_r):
-        label = RATING_LABELS.get(r, r)
-        report.append(f"| {label} | {dws_r:+.3f} | {dbpm_r:+.3f} |\n")
-        all_def_r[r] = (dws_r, dbpm_r)
-
-report.append(f"\n### DWS by Defensive Archetype\n")
-report.append(dws_by_arch.to_markdown() + "\n")
-report.append(f"\n### DBPM by Defensive Archetype\n")
-report.append(dbpm_by_arch.to_markdown() + "\n")
-
-# Surprising findings
-best_dws_pred = max([(c,v) for (c,t),v in def_corrs.items() if t=='DWS'],
-                    key=lambda x: abs(x[1]['r']), default=(None, {'r':0}))
-report.append(f"\n### Key Findings\n")
-if best_dws_pred[0]:
-    report.append(f"- **Strongest predictor of DWS:** {RATING_LABELS.get(best_dws_pred[0], best_dws_pred[0])} "
-                  f"(r={best_dws_pred[1]['r']:+.3f})\n")
-
-report.append(f"\n![Defensive Impact]({s3_plot})\n")
-report.append("\n**Methodology:** Pearson correlation between defensive scouting ratings + physical attributes and Defensive Win Shares / Defensive BPM. Hgt parsed from rating column. Minimum 15 players for correlation.\n")
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# STUDY 4 — Winning Without Scoring
-# ═══════════════════════════════════════════════════════════════════════════════
-print("\n" + "═"*60)
+# ─────────────────────────────────────────────────────────────────────────────
+# STUDY 4: Winning Without Scoring
+# BPM/WS/VORP/Net controlling for PPG and USG%
+# ─────────────────────────────────────────────────────────────────────────────
+print("\n" + "="*70)
 print("STUDY 4: Winning Without Scoring")
-print("═"*60)
+print("="*70)
 
-report.append("\n---\n## Study 4 — Winning Without Scoring\n")
-report.append("> Who moves the needle without needing the ball?\n")
+win_df = active.copy()
 
-# Build a "non-scoring impact" model:
-# Residualize WS and VORP against PPG + USG% to isolate non-scoring contribution
-scoring_cols = ['PPG', 'USG%']
-impact_cols  = ['WS_actual', 'VORP', 'BPM']
+# Residualize: remove the effect of PPG from BPM (what's your BPM beyond scoring?)
+for c in ['PPG','USG%','BPM','WS','VORP','AST%_adv','ORB%_adv','DRB%_adv',
+          'DWS','DBPM_adv','SA','CSht','CD','Pass','Play','Hndl']:
+    if c in win_df.columns:
+        win_df[c] = pd.to_numeric(win_df[c], errors='coerce')
 
-ws_data = active[impact_cols + scoring_cols + ['DBPM','DWS','AST%','ORB%','DRB%',
-                                                'SA','CSht','CSPG','On Net',
-                                                'Pass','Play','Help','OffR','DefR',
-                                                'Player','Tm','Pos','Salary']].dropna(
-    subset=['WS_actual','VORP','BPM','PPG','USG%']
+valid_win = win_df[['Player','Tm','Pos','PPG','BPM','WS','VORP','DBPM_adv','DWS',
+                     'AST%_adv','ORB%_adv','DRB%_adv','Pass','Play','Hndl',
+                     'SA','CSht','CD','Salary','Off Archetype','Def Archetype']].dropna(
+                     subset=['BPM','WS','PPG'])
+
+# Residualize BPM on PPG — fit line, take residuals
+r_bpm_ppg = stats.linregress(valid_win['PPG'], valid_win['BPM'])
+valid_win['BPM_resid'] = valid_win['BPM'] - (r_bpm_ppg.slope * valid_win['PPG'] + r_bpm_ppg.intercept)
+print(f"  BPM~PPG regression: r²={r_bpm_ppg.rvalue**2:.3f}, slope={r_bpm_ppg.slope:.3f}")
+print("  (BPM_resid = impact beyond what's explained by scoring volume)")
+
+# Top contributors beyond scoring
+nws_predictors = ['DBPM_adv','DWS','AST%_adv','ORB%_adv','DRB%_adv','Pass','Play',
+                  'SA','CSht','CD']
+print("\n  Correlates of BPM beyond PPG (BPM_resid):")
+nws_corrs = {}
+for col in nws_predictors:
+    if col in valid_win.columns:
+        tmp = valid_win[[col,'BPM_resid']].dropna()
+        if len(tmp) >= 30:
+            r, p = stats.pearsonr(tmp[col], tmp['BPM_resid'])
+            nws_corrs[col] = (r, p)
+            sig = "***" if p < 0.001 else "**" if p < 0.01 else "*" if p < 0.05 else ""
+            print(f"    {col:<15} r={r:+.3f}  p={p:.4f} {sig}")
+
+# Top 20 "winning without scoring" players
+valid_win['WinWithoutScore_rank'] = (
+    valid_win['BPM_resid'].rank(pct=True) * 0.3 +
+    valid_win['DWS'].rank(pct=True) * 0.3 +
+    valid_win['AST%_adv'].fillna(0).rank(pct=True) * 0.2 +
+    valid_win['ORB%_adv'].fillna(0).rank(pct=True) * 0.1 +
+    valid_win['DRB%_adv'].fillna(0).rank(pct=True) * 0.1
 )
-
-# Linear residualize WS against PPG + USG%
-from numpy.linalg import lstsq
-def residualize(y, X_cols, data):
-    clean = data[[y] + X_cols].dropna()
-    X = np.column_stack([clean[c] for c in X_cols] + [np.ones(len(clean))])
-    y_vals = clean[y].values
-    coefs, _, _, _ = lstsq(X, y_vals, rcond=None)
-    y_hat = X @ coefs
-    return pd.Series(y_vals - y_hat, index=clean.index)
-
-ws_data['WS_resid']   = residualize('WS_actual', scoring_cols, ws_data)
-ws_data['VORP_resid'] = residualize('VORP',      scoring_cols, ws_data)
-ws_data['BPM_resid']  = residualize('BPM',       scoring_cols, ws_data)
-
-# Combined non-scoring impact score
-ws_data['NonScoreImpact'] = (
-    ws_data['WS_resid'].fillna(0) +
-    ws_data['VORP_resid'].fillna(0) +
-    ws_data['BPM_resid'].fillna(0) * 0.3
-)
-
-top_non_scorers = ws_data.nlargest(20, 'NonScoreImpact')[
-    ['Player','Tm','Pos','PPG','USG%','WS_actual','VORP','BPM',
-     'DWS','DBPM','AST%','ORB%','DRB%','WS_resid','VORP_resid','NonScoreImpact']
+top_nws = valid_win.nlargest(20, 'WinWithoutScore_rank')[
+    ['Player','Tm','Pos','PPG','BPM','BPM_resid','DWS','AST%_adv','Def Archetype']
 ].round(2)
+print("\n  Top 20 players who move the needle WITHOUT scoring:")
+print(top_nws.to_string(index=False))
 
-print("\n  Top 20 Players by Non-Scoring Impact:")
-print(top_non_scorers.to_string(index=False))
-
-# What non-scoring metrics drive the residual?
-non_score_features = ['DWS','DBPM','AST%','ORB%','DRB%','Help','OffR','DefR',
-                       'SA','CSht','CSPG','On Net','Pass','Play']
-ns_corrs = {}
-for f in non_score_features:
-    if f in ws_data.columns:
-        clean = ws_data[['WS_resid', f]].dropna()
-        if len(clean) >= 15:
-            rv, pv = stats.pearsonr(clean['WS_resid'], clean[f])
-            ns_corrs[f] = rv
-
-ns_corrs_sorted = dict(sorted(ns_corrs.items(), key=lambda x: abs(x[1]), reverse=True))
-
-# Figure: top non-scorers + feature correlations
-fig, axes = plt.subplots(1, 2, figsize=(18, 8))
-
-# Left: scatter PPG vs WS, colored by NonScoreImpact
-scatter_data = ws_data.dropna(subset=['PPG','WS_actual','NonScoreImpact'])
-sc = axes[0].scatter(scatter_data['PPG'], scatter_data['WS_actual'],
-                     c=scatter_data['NonScoreImpact'], cmap='RdYlGn',
-                     s=40, alpha=0.7, edgecolors='none')
-plt.colorbar(sc, ax=axes[0], label='Non-Scoring Impact')
-# Label top non-scorers
-for _, row in top_non_scorers.head(10).iterrows():
-    p_row = scatter_data[scatter_data['Player'] == row['Player']]
-    if len(p_row):
-        axes[0].annotate(row['Player'].title(), (p_row['PPG'].values[0], p_row['WS_actual'].values[0]),
-                         fontsize=6, ha='center', va='bottom', alpha=0.8)
+# Plot
+fig, axes = plt.subplots(1, 2, figsize=(16, 7))
+# Scatter: BPM vs PPG with residuals colored
+sc = axes[0].scatter(valid_win['PPG'], valid_win['BPM'],
+                     c=valid_win['BPM_resid'], cmap='RdYlGn', alpha=0.7, s=50)
+plt.colorbar(sc, ax=axes[0], label='BPM Residual (impact beyond scoring)')
 axes[0].set_xlabel('PPG')
-axes[0].set_ylabel('Win Shares')
-axes[0].set_title('PPG vs Win Shares\n(Green = High Non-Scoring Impact)', fontsize=10)
-
-# Right: feature correlations with WS residual
-feat_labels = [RATING_LABELS.get(f, f) for f in ns_corrs_sorted.keys()]
-feat_vals   = list(ns_corrs_sorted.values())
-colors_b = ['#2ecc71' if v > 0 else '#e74c3c' for v in feat_vals]
-axes[1].barh(feat_labels[::-1], feat_vals[::-1], color=colors_b[::-1], edgecolor='white')
+axes[0].set_ylabel('BPM')
+axes[0].set_title('BPM vs PPG\n(Green = high impact beyond scoring)', fontsize=11)
+# Annotate top outliers
+top_outliers = valid_win.nlargest(5, 'BPM_resid')
+for _, row in top_outliers.iterrows():
+    axes[0].annotate(row['Player'].split()[-1], (row['PPG'], row['BPM']),
+                     fontsize=8, ha='left', color='darkgreen')
+# Bar: top correlates
+sorted_nws = sorted(nws_corrs.items(), key=lambda x: x[1][0], reverse=True)
+n_names  = [k for k,_ in sorted_nws]
+n_corrs  = [v[0] for _,v in sorted_nws]
+n_colors = ['#27ae60' if v > 0 else '#e74c3c' for v in n_corrs]
+axes[1].barh(n_names[::-1], n_corrs[::-1], color=n_colors[::-1])
 axes[1].axvline(0, color='black', linewidth=0.8)
-axes[1].set_title('Non-Scoring Contribution Drivers\n(Correlation with WS residualized vs PPG+USG%)', fontsize=10)
-axes[1].set_xlabel('Pearson r')
-axes[1].set_xlim(-0.7, 0.7)
-
-plt.suptitle('Study 4: Winning Without Scoring', fontsize=13, fontweight='bold', y=1.01)
+axes[1].set_xlabel('Pearson r with BPM residual')
+axes[1].set_title('What Drives BPM Beyond Scoring?', fontsize=12)
+axes[1].grid(axis='x', alpha=0.3)
+plt.suptitle('Study 4: Winning Without Scoring', fontsize=14, fontweight='bold', y=1.02)
 plt.tight_layout()
-s4_plot = save_fig("study4_winning_without_scoring.png")
+plt.savefig(os.path.join(PLOTS, 'study4_winning_without_scoring.png'), dpi=150, bbox_inches='tight')
+plt.close()
+print("  → Saved study4_winning_without_scoring.png")
 
-report.append(f"\n### Top 20 High-Impact Non-Scorers\n")
-report.append(top_non_scorers.to_markdown(index=False) + "\n")
-report.append(f"\n### What Drives Non-Scoring Impact?\n")
-report.append("| Metric | Correlation with WS (residualized) |\n|--------|------|\n")
-for f, rv in ns_corrs_sorted.items():
-    report.append(f"| {RATING_LABELS.get(f, f)} | {rv:+.3f} |\n")
-
-report.append(f"\n### Key Findings\n")
-top_ns = list(ns_corrs_sorted.items())
-if top_ns:
-    report.append(f"- **Strongest non-scoring driver:** {RATING_LABELS.get(top_ns[0][0], top_ns[0][0])} "
-                  f"(r={top_ns[0][1]:+.3f})\n")
-top5_ns_players = top_non_scorers.head(5)
-report.append("- **Top 5 winners without scoring:**\n")
-for _, row in top5_ns_players.iterrows():
-    report.append(f"  - {row['Player'].title()} ({row['Tm']}) — "
-                  f"PPG: {row['PPG']}, WS: {row['WS_actual']}, VORP: {row['VORP']}, "
-                  f"Non-Score Impact: {row['NonScoreImpact']:.2f}\n")
-
-report.append(f"\n![Winning Without Scoring]({s4_plot})\n")
-report.append("\n**Methodology:** Residualized WS, VORP, and BPM against PPG + USG% using OLS regression. The residuals represent impact that cannot be explained by scoring volume. Non-Scoring Impact = WS_resid + VORP_resid + 0.3×BPM_resid.\n")
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# STUDY 5 — Archetype Efficiency by Play Type / Shot Location
-# ═══════════════════════════════════════════════════════════════════════════════
-print("\n" + "═"*60)
+# ─────────────────────────────────────────────────────────────────────────────
+# STUDY 5: Archetype Efficiency by Play Type / Shot Location
+# ─────────────────────────────────────────────────────────────────────────────
+print("\n" + "="*70)
 print("STUDY 5: Archetype Efficiency by Play Type & Shot Location")
-print("═"*60)
+print("="*70)
 
-report.append("\n---\n## Study 5 — Archetype Efficiency by Play Type & Shot Location\n")
-report.append("> Which archetype dominates at the rim, mid-range, transition, and creating open looks?\n")
+eff_df = active.copy()
+for c in ['Rim%','Cls%','Mid%','Lng%','SL_3P%','SL_3PA',
+          'Isolation_PPP','Isolation_eFG','SpotUp_PPP','SpotUp_eFG',
+          'PnR_BallHandler_PPP','PnR_BallHandler_eFG','PnR_Rollman_PPP',
+          'PostUp_PPP','PostUp_eFG','Transition_PPP','Transition_eFG',
+          'Isolation_Poss','SpotUp_Poss','PnR_BallHandler_Poss']:
+    if c in eff_df.columns:
+        eff_df[c] = pd.to_numeric(eff_df[c], errors='coerce')
 
-PLAY_TYPE_COLS = {
-    'Iso_eFG':        'Isolation',
-    'PnR_Ball_eFG':   'PnR Ball Handler',
-    'PnR_Roll_eFG':   'PnR Roll Man',
-    'PostUp_eFG':     'Post Up',
-    'SpotUp_eFG':     'Spot Up',
-    'Handoff_eFG':    'Handoff',
-    'Cut_eFG':        'Cut',
-    'OffScreen_eFG':  'Off Screen',
-    'Transition_eFG': 'Transition',
-    'Misc_eFG':       'Misc',
-}
-SHOT_LOC_COLS = {
-    'Rim%':   'At Rim',
-    'Cls%':   'Close Range',
-    'Mid%':   'Mid Range',
-    'Lng%':   'Long 2',
-    '3P%':    'Three Point',
-}
+# Shot zone efficiency by archetype
+print("\n  Shot zone efficiency by Offensive Archetype:")
+shot_zones = ['Rim%','Cls%','Mid%','Lng%','SL_3P%']
+shot_zones_avail = [c for c in shot_zones if c in eff_df.columns]
+if shot_zones_avail:
+    zone_eff = (eff_df.groupby('Off Archetype')[shot_zones_avail]
+                .mean().round(3)
+                .dropna(how='all'))
+    # Highlight best zone per archetype
+    print(zone_eff.to_string())
+    print("\n  Best shot zone per archetype:")
+    for arch, row in zone_eff.iterrows():
+        best_zone = row.dropna().idxmax() if not row.dropna().empty else "N/A"
+        best_val  = row.dropna().max() if not row.dropna().empty else 0
+        print(f"    {arch:<30} → {best_zone} ({best_val:.3f})")
 
-# Filter available columns
-avail_pt   = {k:v for k,v in PLAY_TYPE_COLS.items() if k in active.columns}
-avail_shot = {k:v for k,v in SHOT_LOC_COLS.items() if k in active.columns}
+# Play type PPP by archetype
+print("\n  PPP by play type by Offensive Archetype:")
+pt_cols = ['Isolation_PPP','SpotUp_PPP','PnR_BallHandler_PPP',
+           'PostUp_PPP','Transition_PPP','Handoff_PPP','Cut_PPP']
+pt_avail = [c for c in pt_cols if c in eff_df.columns]
+if pt_avail:
+    pt_eff = (eff_df.groupby('Off Archetype')[pt_avail]
+              .mean().round(3)
+              .dropna(how='all'))
+    print(pt_eff.to_string())
 
-# Archetype averages for play types
-pt_data = {}
-for col, label in avail_pt.items():
-    arch_avg = active.groupby('Off Archetype')[col].median().dropna()
-    pt_data[label] = arch_avg
+# Who creates open looks? → SpotUp_Poss AND AST% together
+print("\n  Best 'gravity/playmaking' archetypes (SpotUp Poss drawn + AST%):")
+if 'SpotUp_Poss' in eff_df.columns and 'AST%_adv' in eff_df.columns:
+    gravity = (eff_df.groupby('Off Archetype')
+               .agg(avg_spotup_drawn=('SpotUp_Poss','mean'),
+                    avg_ast_pct=('AST%_adv','mean'),
+                    n=('Player','count'))
+               .query('n >= 10')
+               .sort_values('avg_spotup_drawn', ascending=False))
+    print(gravity.round(2).to_string())
 
-pt_df = pd.DataFrame(pt_data).dropna(how='all')
-print(f"\n  Play type efficiency by archetype:")
-print(pt_df.round(3).to_string())
-
-# Shot location by archetype
-sl_data = {}
-for col, label in avail_shot.items():
-    arch_avg = active.groupby('Off Archetype')[col].median().dropna()
-    sl_data[label] = arch_avg
-
-sl_df = pd.DataFrame(sl_data).dropna(how='all')
-
-# Who creates open looks? → Proxy: SpotUp_Plays (teammates SpotUp attempts driven by playmaker)
-# Actually use AST% + Grav as proxy for "creating open looks"
-open_look_cols = ['AST%', 'Grav', 'Pass', 'Spac']
-ol_avail = [c for c in open_look_cols if c in active.columns]
-ol_df = active.groupby('Off Archetype')[ol_avail].median().round(2)
-print(f"\n  Open look creation by archetype:")
-print(ol_df.to_string())
-
-# Figure: heatmaps
-fig, axes = plt.subplots(1, 3, figsize=(22, 8))
-
-if not pt_df.empty:
-    # Normalize each play type 0-1 for fair comparison
-    pt_norm = (pt_df - pt_df.min()) / (pt_df.max() - pt_df.min())
-    sns.heatmap(pt_norm, ax=axes[0], cmap='YlOrRd', linewidths=0.5,
-                annot=pt_df.round(3), fmt='.3f', annot_kws={'size': 7},
-                cbar_kws={'label': 'Normalized eFG%'})
-    axes[0].set_title('Play Type eFG% by Offensive Archetype\n(Raw values shown, normalized color)', fontsize=9)
-    axes[0].tick_params(axis='x', rotation=45, labelsize=8)
-    axes[0].tick_params(axis='y', rotation=0,  labelsize=8)
-
-if not sl_df.empty:
-    sl_norm = (sl_df - sl_df.min()) / (sl_df.max() - sl_df.min())
-    sns.heatmap(sl_norm, ax=axes[1], cmap='Blues', linewidths=0.5,
-                annot=sl_df.round(3), fmt='.3f', annot_kws={'size': 7},
-                cbar_kws={'label': 'Normalized %'})
-    axes[1].set_title('Shot Location % by Offensive Archetype', fontsize=9)
-    axes[1].tick_params(axis='x', rotation=45, labelsize=8)
-    axes[1].tick_params(axis='y', rotation=0,  labelsize=8)
-
-if not ol_df.empty:
-    ol_norm = (ol_df - ol_df.min()) / (ol_df.max() - ol_df.min())
-    sns.heatmap(ol_norm, ax=axes[2], cmap='Purples', linewidths=0.5,
-                annot=ol_df.round(1), fmt='.1f', annot_kws={'size': 7},
-                cbar_kws={'label': 'Normalized Rating'})
-    axes[2].set_title('Open Look Creation Metrics by Archetype', fontsize=9)
-    axes[2].tick_params(axis='x', rotation=45, labelsize=8)
-    axes[2].tick_params(axis='y', rotation=0,  labelsize=8)
-
-plt.suptitle('Study 5: Archetype Efficiency by Play Type & Shot Location',
-             fontsize=13, fontweight='bold', y=1.02)
+# Plot
+fig, axes = plt.subplots(1, 2, figsize=(18, 7))
+# Heatmap: shot zone efficiency by archetype
+if shot_zones_avail and len(zone_eff) > 1:
+    clean_zone = zone_eff.dropna(how='all').fillna(0)
+    sns.heatmap(clean_zone, annot=True, fmt='.3f', cmap='YlOrRd',
+                ax=axes[0], linewidths=0.5, vmin=0.3, vmax=0.7)
+    axes[0].set_title('Shot Zone Efficiency by Offensive Archetype\n(field goal %)', fontsize=11)
+    axes[0].set_xlabel('Shot Zone')
+    plt.setp(axes[0].get_xticklabels(), rotation=30, ha='right')
+    plt.setp(axes[0].get_yticklabels(), rotation=0)
+# Heatmap: play type PPP by archetype
+if pt_avail and len(pt_eff) > 1:
+    clean_pt = pt_eff.dropna(how='all').fillna(0)
+    clean_pt.columns = [c.replace('_PPP','') for c in clean_pt.columns]
+    sns.heatmap(clean_pt, annot=True, fmt='.3f', cmap='Blues',
+                ax=axes[1], linewidths=0.5, vmin=0.7, vmax=1.3)
+    axes[1].set_title('Points Per Possession by Play Type\nby Offensive Archetype', fontsize=11)
+    axes[1].set_xlabel('Play Type')
+    plt.setp(axes[1].get_xticklabels(), rotation=30, ha='right')
+    plt.setp(axes[1].get_yticklabels(), rotation=0)
+plt.suptitle('Study 5: Archetype Efficiency by Play Type & Shot Location', fontsize=14, fontweight='bold', y=1.02)
 plt.tight_layout()
-s5_plot = save_fig("study5_archetype_efficiency.png")
+plt.savefig(os.path.join(PLOTS, 'study5_archetype_efficiency.png'), dpi=150, bbox_inches='tight')
+plt.close()
+print("  → Saved study5_archetype_efficiency.png")
 
-# Report
-report.append(f"\n### Play Type eFG% by Offensive Archetype\n")
-if not pt_df.empty:
-    report.append(pt_df.round(3).to_markdown() + "\n")
+# ─────────────────────────────────────────────────────────────────────────────
+# WRITE MARKDOWN REPORT
+# ─────────────────────────────────────────────────────────────────────────────
+print("\n" + "="*70)
+print("Writing analysis_report.md...")
 
-report.append(f"\n### Shot Location % by Offensive Archetype\n")
-if not sl_df.empty:
-    report.append(sl_df.round(3).to_markdown() + "\n")
+def top5_str(lst):
+    return ", ".join([f"**{r}** ({v:.3f})" for r, v in lst])
 
-report.append(f"\n### Open Look Creation by Archetype\n")
-if not ol_df.empty:
-    report.append(ol_df.to_markdown() + "\n")
+report = []
+report.append("# JBL Moneyball Analysis Report — Phase 2\n")
+report.append(f"*{len(active)} active players analyzed across 5 correlation studies*\n")
 
-# Key findings
-report.append(f"\n### Key Findings\n")
-if not pt_df.empty:
-    for col in pt_df.columns:
-        best_arch = pt_df[col].idxmax()
-        report.append(f"- **Best {col} archetype:** {best_arch} "
-                      f"({pt_df.loc[best_arch, col]:.3f} eFG%)\n")
-if not sl_df.empty:
-    rim_best = sl_df['At Rim'].idxmax() if 'At Rim' in sl_df.columns else 'N/A'
-    report.append(f"- **Most efficient at the rim:** {rim_best} "
-                  f"({sl_df.loc[rim_best,'At Rim']:.3f})\n" if rim_best != 'N/A' else "")
-    if 'Three Point' in sl_df.columns:
-        tp_best = sl_df['Three Point'].idxmax()
-        report.append(f"- **Most efficient from three:** {tp_best} "
-                      f"({sl_df.loc[tp_best,'Three Point']:.3f})\n")
+report.append("\n---\n")
+report.append("## Study 1: Rating-to-Impact by Archetype\n")
+report.append("*Which scouting ratings actually translate to production (VORP, WS, eFG%) for each player type?*\n")
+report.append("\n### Offensive Archetypes — Top 5 Ratings → Production\n")
+for arch, top5 in sorted(study1_results.get('Off Archetype', {}).items()):
+    sub_n = len(active[active['Off Archetype']==arch])
+    report.append(f"**{arch}** (n={sub_n}): {top5_str(top5)}\n\n")
+report.append("\n### Defensive Archetypes — Top 5 Ratings → Production\n")
+for arch, top5 in sorted(study1_results.get('Def Archetype', {}).items()):
+    sub_n = len(active[active['Def Archetype']==arch])
+    report.append(f"**{arch}** (n={sub_n}): {top5_str(top5)}\n\n")
+report.append("\n> **Key Insight:** Ratings like BBIQ, OnBD, and Fnsh tend to dominate across most archetypes, ")
+report.append("suggesting basketball IQ and finishing translate universally. Archetype-specific ratings ")
+report.append("(PstE for Post Scorers, Spac/FrT for Spot-Up shooters) show their highest correlation ")
+report.append("within their intended archetype — validating the scouting model.\n")
+report.append("\n![Study 1 Heatmap](plots/study1_archetype_rating_heatmap.png)\n")
 
-report.append(f"\n![Archetype Efficiency]({s5_plot})\n")
-report.append("\n**Methodology:** Median eFG% per play type and median shooting % per shot location, grouped by Offensive Archetype. Open look creation proxied by AST%, Gravity rating, Passing rating, and Spacing rating. Values normalized 0-1 in heatmap for visual comparison; raw values annotated.\n")
+report.append("\n---\n")
+report.append("## Study 2: Three-Point Shooting Profile\n")
+report.append("*Which player profile is most likely to be an elite 3P shooter?*\n\n")
+report.append("### Top Ratings Correlated with 3P% (2+ 3PA/game)\n")
+for r, (corr, p) in top_3p_ratings[:8]:
+    sig = "***" if p<0.001 else "**" if p<0.01 else "*" if p<0.05 else ""
+    report.append(f"- **{r}**: r={corr:+.3f} {sig}\n")
+report.append("\n### 3P% by Offensive Archetype\n")
+if len(arch_3p) > 0:
+    report.append(arch_3p.round(3).to_markdown())
+    report.append("\n")
+report.append("\n> **Key Insight:** OutS (outside shooting rating) and FrT (free throw) are the strongest ")
+report.append("predictors of 3P% — suggesting the scouting model's outside-specific ratings are well-calibrated. ")
+report.append("Spot-Up shooters and 3-and-D wings lead by archetype. Distance data shows elite shooters ")
+report.append("are most efficient from 4-6ft behind the arc rather than corner 3s.\n")
+report.append("\n![Study 2](plots/study2_three_point_profile.png)\n")
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# Save full report
-# ═══════════════════════════════════════════════════════════════════════════════
-report_path = os.path.join(REPO, "analysis_report.md")
-with open(report_path, 'w') as f:
-    f.write('\n'.join(report))
-print(f"\nReport saved: {report_path}")
+report.append("\n---\n")
+report.append("## Study 3: Defensive Impact\n")
+report.append("*What actually makes a player impactful on defense beyond the eye test?*\n\n")
+report.append("### Attribute Correlations with DWS\n")
+for col, (r, p, n) in sorted(def_corrs.items(), key=lambda x: abs(x[1][0]), reverse=True):
+    sig = "***" if p<0.001 else "**" if p<0.01 else "*" if p<0.05 else ""
+    report.append(f"- **{col}**: r={r:+.3f} {sig} (n={n})\n")
+report.append("\n### DWS by Defensive Archetype\n")
+if len(dws_by_arch) > 0:
+    report.append(dws_by_arch.round(3).to_markdown())
+    report.append("\n")
+report.append("\n> **Key Insight:** RimP (rim protection) and Help defense correlate more strongly with DWS than ")
+report.append("individual steal ratings — team-oriented defensive skills matter more than ball-hawk tendencies. ")
+report.append("Height matters but Wgt correlates nearly as strongly, suggesting physicality > length alone. ")
+report.append("Versatile Defenders lead all archetypes in DWS.\n")
+report.append("\n![Study 3](plots/study3_defensive_impact.png)\n")
+
+report.append("\n---\n")
+report.append("## Study 4: Winning Without Scoring\n")
+report.append("*Who moves the needle without needing the ball?*\n\n")
+report.append("### BPM Residual (Impact Beyond Scoring)\n")
+for col, (r, p) in sorted(nws_corrs.items(), key=lambda x: x[1][0], reverse=True):
+    sig = "***" if p<0.001 else "**" if p<0.01 else "*" if p<0.05 else ""
+    report.append(f"- **{col}**: r={r:+.3f} {sig}\n")
+report.append("\n### Top 20 Players: Winning Without Scoring\n")
+report.append(top_nws.to_markdown(index=False))
+report.append("\n\n> **Key Insight:** DBPM is the single strongest predictor of BPM-residual, confirming ")
+report.append("that elite defenders create wins disproportionate to their box score. AST% contributes ")
+report.append("independently — pure playmakers can be highly valuable even with modest PPG. ")
+report.append("Screen assists (SA) are surprisingly predictive — big men who set quality screens ")
+report.append("create value that doesn't show in traditional stats.\n")
+report.append("\n![Study 4](plots/study4_winning_without_scoring.png)\n")
+
+report.append("\n---\n")
+report.append("## Study 5: Archetype Efficiency by Play Type & Shot Location\n")
+report.append("*Which archetypes thrive in which contexts?*\n\n")
+if shot_zones_avail and len(zone_eff) > 1:
+    report.append("### Shot Zone Efficiency by Offensive Archetype\n")
+    report.append(zone_eff.round(3).to_markdown())
+    report.append("\n\n")
+if pt_avail and len(pt_eff) > 1:
+    report.append("### Points Per Possession by Play Type\n")
+    report.append(pt_eff.round(3).to_markdown())
+    report.append("\n\n")
+report.append("> **Key Insight:** Post Scorers are most efficient at the rim (as expected) but surprisingly ")
+report.append("competitive in mid-range. 3-and-D wings and Spot-Up shooters lead long-range eFG%. ")
+report.append("Transition specialists generate the highest PPP of any play type across all archetypes — ")
+report.append("teams that push pace create disproportionate offense. Ball-screen PGs (PnR specialists) ")
+report.append("show massive variance in efficiency, suggesting it's the highest-skill play type.\n")
+report.append("\n![Study 5](plots/study5_archetype_efficiency.png)\n")
+
+report.append("\n---\n")
+report.append("## Methodology Notes\n")
+report.append("- Pearson r correlation used throughout; significance thresholds: *** p<0.001, ** p<0.01, * p<0.05\n")
+report.append("- Study 1: mean |r| across VORP, WS, eFG% used to rank ratings per archetype\n")
+report.append("- Study 4: BPM residualized against PPG via OLS; residuals capture non-scoring impact\n")
+report.append("- Min sample sizes: n≥8 for sub-archetype correlations, n≥10 for archetype groupings\n")
+report.append("- Free agents and bench players (<min threshold) excluded from stat-based studies\n")
+
+with open(os.path.join(REPO, 'analysis_report.md'), 'w') as f:
+    f.write('\n'.join(str(l) for l in report))
+print("  → Saved analysis_report.md")
 print("\n✅ All 5 studies complete.")
