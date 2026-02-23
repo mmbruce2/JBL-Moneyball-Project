@@ -1,8 +1,12 @@
 """
-JBL Moneyball — Data Merge Pipeline (Fixed)
-Root cause fixed: stat files use 3-letter team abbreviations (Hur, Bar, etc.)
-while Players/PerGame/OnOff use full names. All Tm values are now normalized
-to full team names before any merge.
+JBL Moneyball — Data Merge Pipeline v3 (Clean)
+
+Root causes fixed:
+  1. Stat files use 3-letter team abbrevs (Hur/Bar) vs full names in Players → mapped
+  2. Traded players appear as "Tot" in stat files → deduplicated to one row per player
+     (prefer "Tot" row for aggregate stats, else highest-minutes row)
+  3. nbsp/whitespace garbage in player names → stripped
+  4. Duplicate column conflicts handled explicitly per file
 """
 import pandas as pd
 import numpy as np
@@ -12,58 +16,72 @@ warnings.filterwarnings('ignore')
 BASE = "/Users/maxx/Documents/JBL Datasets"
 REPO = "/Users/maxx/Documents/JBL-Moneyball-Project"
 
-# ── Team abbreviation → full name map ────────────────────────────────────────
 TEAM_MAP = {
-    'Bar': 'Barons',    'Bli': 'Blizzards', 'Bul': 'Bullets',
-    'Cal': 'Calaveras', 'Col': 'Colonels',  'Cru': 'Crusaders',
-    'Cyc': 'Cyclones',  'Dev': 'Devils',    'Dra': 'Dragons',
-    'Dro': 'Drones',    'Fir': 'Fireballs', 'Gia': 'Giants',
-    'Hur': 'Hurricanes','Hus': 'Huskies',   'Jag': 'Jaguars',
-    'Jai': 'Jailbirds', 'Kin': 'Kings',     'Kni': 'Knights',
-    'Lig': 'Lightning', 'Lum': 'Lumberjacks','Mus': 'Mustangs',
-    'Pil': 'Pilots',    'Pre': 'Predators', 'Ren': 'Renegades',
-    'Roc': 'Rockets',   'Sai': 'Saints',    'Sco': 'Scorpions',
-    'Sky': 'Skyhawks',  'Sta': 'Stars',     'Sto': 'Stonecutters',
-    'Thu': 'Thunder',   'Tri': 'Tritons',   'Vip': 'Vipers',
-    'Vul': 'Vultures',  'War': 'Warriors',  'Wol': 'Wolves',
+    'Bar':'Barons',     'Bli':'Blizzards',    'Bul':'Bullets',
+    'Cal':'Calaveras',  'Col':'Colonels',      'Cru':'Crusaders',
+    'Cyc':'Cyclones',   'Dev':'Devils',         'Dra':'Dragons',
+    'Dro':'Drones',     'Fir':'Fireballs',      'Gia':'Giants',
+    'Hur':'Hurricanes', 'Hus':'Huskies',        'Jag':'Jaguars',
+    'Jai':'Jailbirds',  'Kin':'Kings',          'Kni':'Knights',
+    'Lig':'Lightning',  'Lum':'Lumberjacks',    'Mus':'Mustangs',
+    'Pil':'Pilots',     'Pre':'Predators',      'Ren':'Renegades',
+    'Roc':'Rockets',    'Sai':'Saints',         'Sco':'Scorpions',
+    'Sky':'Skyhawks',   'Sta':'Stars',          'Sto':'Stonecutters',
+    'Thu':'Thunder',    'Tri':'Tritons',        'Vip':'Vipers',
+    'Vul':'Vultures',   'War':'Warriors',       'Wol':'Wolves',
+    'Tot':'TOT',        # traded/combined row
 }
 
-# Play type column order (standard NBA play type sequence)
+DROP_META = ['Rk', 'Pos', 'Age', 'Exp', 'G', 'GS']
+
 PLAY_TYPES = [
     'Isolation', 'PnR_BallHandler', 'PnR_Rollman', 'PostUp',
     'SpotUp', 'Handoff', 'Cut', 'OffScreen', 'Transition', 'Misc'
 ]
 
-def normalize_team(series):
-    """Map abbreviations to full names; leave full names as-is."""
-    return series.astype(str).str.strip().map(
-        lambda x: TEAM_MAP.get(x, x)
-    )
+def clean_player(s):
+    return (s.astype(str)
+             .str.replace('&nbsp;', '', regex=False)
+             .str.strip()
+             .str.lower())
 
-def load(filename, normalize_tm=True):
+def normalize_tm(s):
+    return s.astype(str).str.strip().map(lambda x: TEAM_MAP.get(x, x))
+
+def load(filename):
     df = pd.read_csv(os.path.join(BASE, filename))
     df.columns = df.columns.str.strip()
     if 'Player' in df.columns:
-        df['Player'] = df['Player'].astype(str).str.strip().str.lower()
-    tm_col = 'Tm' if 'Tm' in df.columns else ('Team' if 'Team' in df.columns else None)
-    if tm_col and normalize_tm:
-        df[tm_col] = normalize_team(df[tm_col])
-        if tm_col == 'Team':
-            df = df.rename(columns={'Team': 'Tm'})
+        df['Player'] = clean_player(df['Player'])
+    if 'Tm' in df.columns:
+        df['Tm'] = normalize_tm(df['Tm'])
+    elif 'Team' in df.columns:
+        df['Team'] = normalize_tm(df['Team'])
+        df = df.rename(columns={'Team': 'Tm'})
     return df
 
-# ── METADATA cols to drop from secondary files (exist in base already) ───────
-DROP_META = ['Rk', 'Pos', 'Age', 'Exp', 'G', 'GS']
-
-def prep_secondary(df, suffix_cols=None):
-    """Drop metadata cols; optionally add suffix to stat cols."""
-    df = df.drop(columns=[c for c in DROP_META if c in df.columns], errors='ignore')
-    if suffix_cols:
-        df = df.rename(columns={c: f"{c}_{suffix_cols}" for c in df.columns
-                                  if c not in ['Player', 'Tm', 'MIN']})
+def dedup_to_one_per_player(df, min_col=None):
+    """
+    For players with multiple rows (traded players), keep:
+    - 'TOT' row if it exists (aggregate of all stints)
+    - else the row with the most minutes
+    - else first row
+    Returns one row per player.
+    """
+    if 'Player' not in df.columns:
+        return df
+    df = df.copy()
+    df['_is_tot'] = df['Tm'].astype(str).str.upper() == 'TOT'
+    if min_col and min_col in df.columns:
+        df[min_col] = pd.to_numeric(df[min_col].astype(str).str.replace(',',''), errors='coerce')
+        df = df.sort_values(['_is_tot', min_col], ascending=[False, False])
+    else:
+        df = df.sort_values('_is_tot', ascending=False)
+    df = df.drop_duplicates(subset='Player', keep='first')
+    df = df.drop(columns=['_is_tot'], errors='ignore')
     return df
 
-# ── Load all files ────────────────────────────────────────────────────────────
+# ── Load ──────────────────────────────────────────────────────────────────────
 print("Loading files...")
 players  = load('JBLPlayers.csv')
 per_game = load('JBLPerGame.csv')
@@ -73,143 +91,146 @@ shot_loc = load('JBLShotLocations.csv')
 on_off   = load('JBLOnOff.csv')
 playoffs = load('JBLPlayoffs.csv')
 
-# ── Fix JBLPlayTypes: rename duplicate columns by play type ──────────────────
-print("Fixing JBLPlayTypes column names...")
+# PlayTypes: fix duplicate column names
 pt_raw = load('JBLPlayTypes.csv')
-# Base cols: Rk, Player, Pos, Age, Exp, Tm, G, GS, MIN, Plays
-# Then 10 groups of (Pos/Possessions, PTS, PPP, eFG) — one per play type
-new_pt_cols = ['Rk', 'Player', 'Pos', 'Age', 'Exp', 'Tm', 'G', 'GS', 'MIN', 'Plays']
+new_pt_cols = ['Rk', 'Player', 'Pos', 'Age', 'Exp', 'Tm', 'G', 'GS', 'MIN_pt', 'Plays']
 for pt in PLAY_TYPES:
     new_pt_cols += [f'{pt}_Poss', f'{pt}_PTS', f'{pt}_PPP', f'{pt}_eFG']
 pt_raw.columns = new_pt_cols
-pt_raw['Player'] = pt_raw['Player'].astype(str).str.strip().str.lower()
-pt_raw['Tm'] = normalize_team(pt_raw['Tm'])
+pt_raw['Player'] = clean_player(pt_raw['Player'])
+pt_raw['Tm'] = normalize_tm(pt_raw['Tm'])
 
-# ── Fix OnOff MIN column (has commas like "2,212") ───────────────────────────
-on_off['MIN'] = on_off['MIN'].astype(str).str.replace(',', '').str.strip()
+# ── Dedup all stat files to one row per player ────────────────────────────────
+print("Deduplicating stat files (one row per player)...")
+per_game = dedup_to_one_per_player(per_game, 'MPG')
+advanced = dedup_to_one_per_player(advanced, 'MIN')
+hustle   = dedup_to_one_per_player(hustle,   'MIN')
+shot_loc = dedup_to_one_per_player(shot_loc, 'MIN')
+on_off   = dedup_to_one_per_player(on_off,   'MIN')
+playoffs = dedup_to_one_per_player(playoffs, 'MPG')
+pt_raw   = dedup_to_one_per_player(pt_raw,   'MIN_pt')
+print(f"  Players: {len(players)} | PerGame: {len(per_game)} | Advanced: {len(advanced)} | "
+      f"Hustle: {len(hustle)} | ShotLoc: {len(shot_loc)} | OnOff: {len(on_off)} | "
+      f"Playoffs: {len(playoffs)} | PlayTypes: {len(pt_raw)}")
 
-# ── Rename ShotLocations % cols for clarity ──────────────────────────────────
-shot_loc = shot_loc.rename(columns={
-    '%':   'Pct_2PM_0_2ft',  '%.1': 'Pct_2PM_2_4ft',
-    '%.2': 'Pct_2PM_4_6ft',  '%.3': 'Pct_2PM_6plus',
-    '%.4': 'Pct_3PM_0_2ft',  '%.5': 'Pct_3PM_2_4ft',
-    '%.6': 'Pct_3PM_4_6ft',  '%.7': 'Pct_3PM_6plus',
-})
-# Also rename 3PM/3PA/3P% in shot_loc to avoid conflict with PerGame
-shot_loc = shot_loc.rename(columns={
-    '3PM': 'SL_3PM', '3PA': 'SL_3PA', '3P%': 'SL_3P%',
-    'FT':  'SL_FT',  'FTA': 'SL_FTA', 'FT%': 'SL_FT%',
-    'MIN': 'MIN_shot'
-})
+# ── Rename columns to avoid conflicts before merging ─────────────────────────
+# JBLPlayers already has PPG, RPG, APG, MPG, etc. — drop duplicates from PerGame
+PERGAME_KEEP_UNIQUE = ['FG', 'FGA', '3P', '3PA', 'FT', 'FTA', 'ORB', 'DRB', 'TRB', 'AST', 'STL', 'BLK', 'TOV', 'PF']
+per_game = per_game[['Player'] + PERGAME_KEEP_UNIQUE].copy()
 
-# ── Rename column conflicts across files ──────────────────────────────────────
-# Advanced has its own WS, MIN, TS%, etc.
-advanced = advanced.rename(columns={
-    'WS': 'WS_adv', 'WS/48': 'WS48_adv',
-    'TS%': 'TS%_adv', 'ORtg': 'ORtg_adv', 'DRtg': 'DRtg_adv',
-    'MIN': 'MIN_adv', 'Net': 'NetRtg_adv',
-    'OWS': 'OWS_adv', 'DWS': 'DWS_adv',
-    'PER': 'PER_adv', 'EWA': 'EWA_adv',
+# Advanced — rename cols that conflict with JBLPlayers
+ADV_RENAME = {
+    'WS': 'WS_adv', 'WS/48': 'WS48_adv', 'TS%': 'TS%_adv',
+    'ORtg': 'ORtg_adv', 'DRtg': 'DRtg_adv', 'Net': 'NetRtg_adv',
+    'OWS': 'OWS_adv', 'DWS': 'DWS_adv', 'PER': 'PER_adv', 'EWA': 'EWA_adv',
     'OBPM': 'OBPM_adv', 'DBPM': 'DBPM_adv', 'BPM': 'BPM_adv',
     'VORP': 'VORP_adv', 'ORB%': 'ORB%_adv', 'DRB%': 'DRB%_adv',
     'TRB%': 'TRB%_adv', 'AST%': 'AST%_adv', 'STL%': 'STL%_adv',
     'BLK%': 'BLK%_adv', 'TOV%': 'TOV%_adv', 'USG%': 'USG%_adv',
-    'eFG%': 'eFG%_adv',
+    'eFG%': 'eFG%_adv', 'MIN': 'MIN_adv',
+    'G': 'G_adv', 'GS': 'GS_adv',
+}
+advanced = advanced.drop(columns=DROP_META, errors='ignore').rename(columns=ADV_RENAME)
+
+hustle = hustle.drop(columns=DROP_META, errors='ignore').rename(columns={'MIN': 'MIN_hsl'})
+
+# ShotLocations — rename ambiguous % cols and 3P/FT cols
+shot_loc = shot_loc.rename(columns={
+    'MIN': 'MIN_shot',
+    '3PM': 'SL_3PM', '3PA': 'SL_3PA', '3P%': 'SL_3P%',
+    'FT': 'SL_FT', 'FTA': 'SL_FTA', 'FT%': 'SL_FT%',
+    '%':   'Pct_2PM_0_2ft', '%.1': 'Pct_2PM_2_4ft',
+    '%.2': 'Pct_2PM_4_6ft', '%.3': 'Pct_2PM_6plus',
+    '%.4': 'Pct_3PM_0_2ft', '%.5': 'Pct_3PM_2_4ft',
+    '%.6': 'Pct_3PM_4_6ft', '%.7': 'Pct_3PM_6plus',
 })
-hustle = hustle.rename(columns={'MIN': 'MIN_hsl'})
-on_off = on_off.rename(columns={'MIN': 'MIN_onoff'})
+shot_loc = shot_loc.drop(columns=DROP_META, errors='ignore')
 
-# Playoffs: prefix all stat cols
-po_stats = [c for c in playoffs.columns if c not in ['Player', 'Tm', 'Rk', 'Pos', 'Age', 'Exp', 'G', 'GS']]
-playoffs = playoffs.rename(columns={c: f'PO_{c}' for c in po_stats})
+on_off = on_off.drop(columns=DROP_META, errors='ignore').rename(columns={'MIN': 'MIN_onoff'})
+on_off['MIN_onoff'] = on_off['MIN_onoff'].astype(str).str.replace(',', '').str.strip()
 
-# PlayTypes: rename MIN
-pt_raw = pt_raw.rename(columns={'MIN': 'MIN_pt'})
+# Playoffs prefix — rename BEFORE dropping so G/GS become PO_G/PO_GS
+playoffs = playoffs.drop(columns=['Rk','Pos','Age','Exp'], errors='ignore')  # keep G, GS
+playoffs.columns = ['Player'] + [f'PO_{c}' for c in playoffs.columns if c != 'Player']
 
-print("All files loaded and columns normalized.")
+pt_raw = pt_raw.drop(columns=DROP_META, errors='ignore')
 
-# ── Merge: JBLPlayers is the base (587 players) ──────────────────────────────
-MERGE_KEY = ['Player', 'Tm']
+# ── Merge all on Player name (deduped — safe to merge on name only) ───────────
+print("\nMerging on Player name...")
 
-def left_merge(base, df, label):
-    df = df.drop(columns=[c for c in DROP_META if c in df.columns], errors='ignore')
-    # Find a column unique to df (not in base) to use as match probe
-    unique_cols = [c for c in df.columns if c not in MERGE_KEY and c not in base.columns]
-    merged = pd.merge(base, df, on=MERGE_KEY, how='left', suffixes=('', f'_{label[:3]}'))
-    if unique_cols:
-        probe = unique_cols[0]
-        matched = merged[probe].notna().sum()
+def name_merge(base, df, label):
+    # Only keep Player + unique stat cols from df; drop Tm (not used as key here)
+    df = df.copy()
+    df = df.drop(columns=['Tm'], errors='ignore')
+    overlap = [c for c in df.columns if c != 'Player' and c in base.columns]
+    if overlap:
+        df = df.drop(columns=overlap, errors='ignore')
+    result = pd.merge(base, df, on='Player', how='left')
+    probe_cols = [c for c in df.columns if c not in ['Player','Tm']]
+    if probe_cols:
+        matched = result[probe_cols[0]].notna().sum()
     else:
-        matched = len(merged)  # no unique col to probe, assume all matched
-    print(f"  Merged {label}: {matched}/{len(base)} rows matched ({matched/len(base)*100:.1f}%)")
-    return merged
+        matched = len(result)
+    print(f"  {label}: {matched}/{len(base)} matched ({matched/len(base)*100:.1f}%)")
+    return result
 
-print("\nMerging datasets onto JBLPlayers base (587 players)...")
 merged = players.copy()
-merged = left_merge(merged, per_game,  'JBLPerGame')
-merged = left_merge(merged, advanced,  'JBLAdvanced')
-merged = left_merge(merged, hustle,    'JBLHustle')
-merged = left_merge(merged, shot_loc,  'JBLShotLocations')
-merged = left_merge(merged, on_off,    'JBLOnOff')
-merged = left_merge(merged, playoffs,  'JBLPlayoffs')
-merged = left_merge(merged, pt_raw,    'JBLPlayTypes')
+merged = name_merge(merged, per_game,  'JBLPerGame')
+merged = name_merge(merged, advanced,  'JBLAdvanced')
+merged = name_merge(merged, hustle,    'JBLHustle')
+merged = name_merge(merged, shot_loc,  'JBLShotLocations')
+merged = name_merge(merged, on_off,    'JBLOnOff')
+merged = name_merge(merged, playoffs,  'JBLPlayoffs')
+merged = name_merge(merged, pt_raw,    'JBLPlayTypes')
 
 print(f"\nFinal merged shape: {merged.shape}")
 
 # ── Feature Engineering ────────────────────────────────────────────────────────
-print("\nEngineering features...")
+print("Engineering features...")
 
-# Clean salary
+# Salary: clean to numeric
 merged['Salary'] = pd.to_numeric(
     merged['Salary'].astype(str).str.replace(r'[^\d.]', '', regex=True), errors='coerce'
 )
 
-# WS_actual from WS.1 (WS col in JBLPlayers is height data, WS.1 is actual Win Shares)
+# WS_actual: WS.1 is the real Win Shares (WS col is height/rating data)
 merged['WS_actual'] = pd.to_numeric(merged['WS.1'], errors='coerce')
 
-# Numeric conversions
-num_cols = ['VORP', 'PER', 'BPM', 'PPG', 'RPG', 'APG', 'USG%',
-            'eFG%', 'TS%', '3P%', 'FG%', 'FT%',
-            'WS_adv', 'WS48_adv', 'DWS_adv', 'OWS_adv',
-            'VORP_adv', 'PER_adv', 'BPM_adv', 'OBPM_adv', 'DBPM_adv',
-            'PM', 'BoxC', 'OL', 'Spc', 'aTOV', 'Adj3P%',
-            'SA', 'SAPG', 'CSht', 'CSPG', 'DFL', 'DFPG', 'LBR', 'LBPG', 'CD', 'CDPG',
-            'RimM', 'RimA', 'Rim%', 'ClsM', 'ClsA', 'Cls%',
-            'MidM', 'MidA', 'Mid%', 'LngM', 'LngA', 'Lng%']
-for c in num_cols:
-    if c in merged.columns:
-        merged[c] = pd.to_numeric(merged[c], errors='coerce')
+# Prefer advanced stats (more precise), fallback to Players file
+def num(df, col):
+    return pd.to_numeric(df[col], errors='coerce') if col in df.columns else pd.Series(np.nan, index=df.index)
 
-# Use advanced stats where available (more precise), fall back to Players file
-merged['WS']   = merged['WS_adv'].fillna(merged['WS_actual'])
-merged['DWS']  = merged['DWS_adv'].fillna(pd.to_numeric(merged.get('DWS', pd.Series(dtype=float)), errors='coerce'))
-merged['OWS']  = merged['OWS_adv'].fillna(pd.to_numeric(merged.get('OWS', pd.Series(dtype=float)), errors='coerce'))
-merged['VORP'] = merged['VORP_adv'].fillna(pd.to_numeric(merged['VORP'], errors='coerce'))
-merged['PER']  = merged['PER_adv'].fillna(pd.to_numeric(merged['PER'],  errors='coerce'))
-merged['BPM']  = merged['BPM_adv'].fillna(pd.to_numeric(merged['BPM'],  errors='coerce'))
+merged['WS']   = merged['WS_adv'].combine_first(merged['WS_actual'])
+merged['DWS']  = merged['DWS_adv'].combine_first(num(merged, 'DWS'))
+merged['OWS']  = merged['OWS_adv'].combine_first(num(merged, 'OWS'))
+merged['VORP'] = merged['VORP_adv'].combine_first(num(merged, 'VORP'))
+merged['PER']  = merged['PER_adv'].combine_first(num(merged, 'PER'))
+merged['BPM']  = merged['BPM_adv'].combine_first(num(merged, 'BPM'))
+merged['OBPM'] = merged['OBPM_adv'].combine_first(num(merged, 'OBPM'))
+merged['DBPM'] = merged['DBPM_adv'].combine_first(num(merged, 'DBPM'))
 
-# Value Index: (WS + VORP) per $1M salary
+# Value metrics
 sal_m = (merged['Salary'] / 1_000_000).replace(0, np.nan)
 merged['ValueIndex']    = (merged['WS'].fillna(0) + merged['VORP'].fillna(0)) / sal_m
 merged['DollarPerWS']   = merged['Salary'] / merged['WS'].replace(0, np.nan)
-merged['ScorePerUsage'] = merged['PPG'] / pd.to_numeric(merged['USG%'], errors='coerce').replace(0, np.nan)
+merged['ScorePerUsage'] = num(merged,'PPG') / num(merged,'USG%').replace(0, np.nan)
 
 print("Feature engineering complete.")
 
-# ── Verification: null counts on critical columns ─────────────────────────────
+# ── NULL AUDIT ────────────────────────────────────────────────────────────────
 print("\n── CRITICAL COLUMN NULL AUDIT ──────────────────────────────────────────")
 critical = {
-    'Advanced':      ['PM', 'BoxC', 'OL', 'Spc', 'aTOV', 'Adj3P%', 'WS_adv', 'VORP_adv', 'BPM_adv'],
-    'Hustle':        ['MIN_hsl', 'SA', 'SAPG', 'CSht', 'CSPG', 'DFL', 'DFPG', 'LBR', 'LBPG', 'CD', 'CDPG'],
-    'Shot Location': ['RimM', 'RimA', 'Rim%', 'ClsM', 'ClsA', 'Cls%',
-                      'MidM', 'MidA', 'Mid%', 'LngM', 'LngA', 'Lng%',
-                      'SL_3PM', 'SL_3PA', 'SL_3P%',
-                      '2PM 0-2ft', '2PA 0-2ft', 'Pct_2PM_0_2ft',
-                      '3PM 0-2ft', '3PA 0-2ft', 'Pct_3PM_0_2ft'],
-    'Play Types':    ['Isolation_Poss', 'Isolation_PTS', 'SpotUp_Poss', 'SpotUp_PTS',
-                      'Transition_Poss', 'Transition_PTS'],
-    'OnOff':         ['On ORtg', 'On DRtg', 'On Net', 'Floor Net'],
-    'Computed':      ['WS', 'VORP', 'PER', 'BPM', 'ValueIndex'],
+    'Advanced':      ['MIN_adv','PM','BoxC','OL','Spc','aTOV','Adj3P%','WS_adv','VORP_adv','BPM_adv','RAPM','WARP','DRE','AWS'],
+    'Hustle':        ['MIN_hsl','SA','SAPG','CSht','CSPG','DFL','DFPG','LBR','LBPG','CD','CDPG'],
+    'Shot Location': ['RimM','RimA','Rim%','ClsM','ClsA','Cls%','MidM','MidA','Mid%',
+                      'LngM','LngA','Lng%','SL_3PM','SL_3PA','SL_3P%',
+                      '2PM 0-2ft','2PA 0-2ft','Pct_2PM_0_2ft',
+                      '3PM 0-2ft','3PA 0-2ft','Pct_3PM_0_2ft'],
+    'Play Types':    ['Plays','Isolation_Poss','Isolation_PTS','SpotUp_Poss','SpotUp_PTS',
+                      'PnR_BallHandler_Poss','Transition_Poss','Transition_PTS'],
+    'OnOff':         ['On ORtg','On DRtg','On Net','Floor Net'],
+    'Playoffs':      ['PO_PPG','PO_G'],
+    'Computed':      ['WS','VORP','PER','BPM','ValueIndex','DWS','OWS'],
 }
 all_ok = True
 for section, cols in critical.items():
@@ -218,27 +239,32 @@ for section, cols in critical.items():
         if c in merged.columns:
             n_null = merged[c].isna().sum()
             pct    = n_null / len(merged) * 100
-            flag   = " ⚠️  >50% NULL" if pct > 50 else ""
+            flag   = "  ⚠️  >50% NULL" if pct > 50 else ""
             if pct > 50: all_ok = False
-            print(f"    {c:<28} null={n_null:>3} ({pct:5.1f}%){flag}")
+            print(f"    {c:<30} null={n_null:>3} ({pct:5.1f}%){flag}")
         else:
-            print(f"    {c:<28} *** COLUMN MISSING ***")
+            print(f"    {c:<30} *** COLUMN MISSING ***")
             all_ok = False
 
-print(f"\n{'✅ All critical columns populated.' if all_ok else '⚠️  Some columns need attention.'}")
+print(f"\n{'✅ All critical columns <50% null.' if all_ok else '⚠️  Some columns still >50% null (may be normal for bench/FA players).'}")
+print(f"Note: 587 total players in JBLPlayers; ~413 had enough minutes for stat sheets. "
+      f"~{587-413} players (benchwarmers/injured/free agents) will naturally have NaN in stat cols.")
 
-# ── Save outputs ──────────────────────────────────────────────────────────────
+# ── Save ──────────────────────────────────────────────────────────────────────
 out_path = os.path.join(BASE, 'merged_JBL_Data.csv')
 merged.to_csv(out_path, index=False)
 print(f"\nSaved: {out_path}  ({merged.shape[0]} rows × {merged.shape[1]} cols)")
 
-# Player valuation ranking
-val_cols = ['Player', 'Tm', 'Pos', 'Salary', 'WS', 'VORP', 'PER', 'BPM',
-            'DWS', 'OWS', 'ValueIndex', 'DollarPerWS', 'PPG', 'RPG', 'APG',
-            'Off Archetype', 'Def Archetype']
-val_cols = [c for c in val_cols if c in merged.columns]
-valuation = merged[val_cols].copy().sort_values('ValueIndex', ascending=False)
-valuation.to_csv(os.path.join(BASE, 'player_valuation.csv'), index=False)
-print(f"Saved: player_valuation.csv")
+import shutil
+shutil.copy(out_path, os.path.join(REPO, 'merged_JBL_Data.csv'))
+shutil.copy(os.path.join(BASE, 'merge_data.py'), os.path.join(REPO, 'merge_data.py'))
 
-print("\nDone.")
+val_cols = ['Player','Tm','Pos','Salary','WS','VORP','PER','BPM','DWS','OWS',
+            'ValueIndex','DollarPerWS','PPG','RPG','APG','Off Archetype','Def Archetype']
+val_cols = [c for c in val_cols if c in merged.columns]
+valuation = merged[val_cols].sort_values('ValueIndex', ascending=False)
+val_path = os.path.join(BASE, 'player_valuation.csv')
+valuation.to_csv(val_path, index=False)
+shutil.copy(val_path, os.path.join(REPO, 'player_valuation.csv'))
+print("Saved: player_valuation.csv")
+print("\n✅ Pipeline complete.")
